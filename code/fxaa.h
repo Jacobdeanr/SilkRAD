@@ -1,4 +1,5 @@
-#ifndef __FXAA_H_
+#ifndef __
+_H_
 #define __FXAA_H_
 
 #include "bsp.h"

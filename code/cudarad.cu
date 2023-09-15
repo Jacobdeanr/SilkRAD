@@ -66,19 +66,48 @@ namespace CUDARAD {
 
 
 namespace DirectLighting {
+    //static __device__ inline float attenuate(
+    //        BSP::DWorldLight& light,
+    //        float dist
+    //        ) {
+    
+        //float c = light.constantAtten;
+        //float l = light.linearAtten;
+        //float q = light.quadraticAtten;
+        //float clampedDist = fmaxf(dist, 1e-6);  // or some small value other than 1e-6
+        //return c + l * clampedDist + q * clampedDist * clampedDist;
+        //return 1.0f / (clampedDist * clampedDist);
+    
+    //}
+
     static __device__ inline float attenuate(
-            BSP::DWorldLight& light,
-            float dist
-            ) {
-
-        float c = light.constantAtten;
-        float l = light.linearAtten;
-        float q = light.quadraticAtten;
-
-        return c + l * dist + q * dist * dist;
+        BSP::DWorldLight& light,
+        float dist
+        ) {
+        float clampedDist = fmaxf(dist, 1e-6);  // Avoid division by zero and extremely high values
+        float attenuation = 1.0f / (clampedDist * clampedDist);
+    
+        // Clamp the attenuation between 0 and 1
+        attenuation = fmaxf(0.0f, attenuation);
+        attenuation = fminf(1.0f, attenuation);
+    
+        return attenuation*255.0f;
     }
 
-    __device__ float3 sample_at(
+    static __device__ inline float attenuate(
+        BSP::DWorldLight& light,
+        float3 lightsamplepos,
+        float dist
+    ) {
+        // Avoid division by zero
+        if (dist < 1e-6) {
+            return  0.0f;
+        }
+        
+        return 1.0f * (dist * dist);
+    }
+
+/*    __device__ float3 sample_at(
             CUDABSP::CUDABSP& cudaBSP,
             float3 samplePos,
             float3 sampleNormal=make_float3()
@@ -104,10 +133,10 @@ namespace DirectLighting {
             float3 lightPos = make_float3(light.origin);
             float3 diff = samplePos - lightPos;
 
-            /*
-             * This light is on the wrong side of the current sample.
-             * There's no way it could possibly light it.
-             */
+             //* This light is on the wrong side of the current sample.
+             //* There's no way it could possibly light it.
+             //
+
             if (len(sampleNormal) > 0.0f && dot(diff, sampleNormal) >= 0.0f) {
                 continue;
             }
@@ -122,11 +151,11 @@ namespace DirectLighting {
                 float lightDot = dot(dir, lightNorm);
 
                 if (lightDot < light.stopdot2) {
-                    /* This sample is outside the spotlight cone. */
+                    // This sample is outside the spotlight cone. 
                     continue;
                 }
                 else if (lightDot < light.stopdot) {
-                    /* This sample is within the spotlight's penumbra. */
+                    // This sample is within the spotlight's penumbra. 
                     penumbraScale = (
                         (lightDot - light.stopdot2)
                         / (light.stopdot - light.stopdot2)
@@ -168,7 +197,7 @@ namespace DirectLighting {
                 continue;
             }
 
-            /* I CAN SEE THE LIGHT */
+            // I CAN SEE THE LIGHT
             float attenuation = attenuate(light, dist);
 
             float3 lightContribution = make_float3(light.intensity);
@@ -187,7 +216,142 @@ namespace DirectLighting {
 
         return result;
     }
+    */
 
+    //This is all new. Define raduis of a point light
+    __device__ float simple_rand(unsigned int& seed) {
+        seed = (1103515245 * seed + 12345) & 0x7FFFFFFF;
+        return float(seed & 0xFFFF) / 0xFFFF;
+    }
+    __device__ float3 randomPointOnSphereSurface(float3 center, float radius, unsigned int& seed) {
+        // Generate random spherical coordinates
+        float theta = 2.0f * 3.14159265358979323846f * simple_rand(seed);
+        float phi = acos(2.0f * simple_rand(seed) - 1.0f);
+
+        // Convert to Cartesian coordinates
+        float3 point;
+        point.x = radius * sinf(phi) * cosf(theta);
+        point.y = radius * sinf(phi) * sinf(theta);
+        point.z = radius * cosf(phi);
+
+        return center + point;
+    }
+
+    __device__ float3 calculateLightContribution(
+        float3 sampleLightPos,
+        float3 samplePos,
+        float3 sampleNormal,
+        BSP::DWorldLight& light,
+        float radius
+    ) {
+        float3 diff = samplePos - sampleLightPos;
+        float dist = len(diff);
+        float3 dir = diff / dist;
+
+        float penumbraScale = 1.0f;
+
+        if (light.type == BSP::EMIT_SPOTLIGHT) {
+            float3 lightNorm = make_float3(light.normal);
+            float lightDot = dot(dir, lightNorm);
+
+            if (lightDot < light.stopdot2) {
+                // This sample is outside the spotlight cone. 
+                return make_float3(0, 0, 0);  // Return zero contribution
+            }
+            else if (lightDot < light.stopdot) {
+                // This sample is within the spotlight's penumbra. 
+                penumbraScale = (
+                    (lightDot - light.stopdot2)
+                    / (light.stopdot - light.stopdot2)
+                    );
+            }
+        }
+
+        // Check if the light is on the wrong side of the sample
+        if (len(sampleNormal) > 0.0f && dot(diff, sampleNormal) >= 0.0f) {
+            return make_float3(0, 0, 0);
+        }
+
+        const float EPSILON = 1e-3f;
+        samplePos -= dir * EPSILON;
+
+        // Calculate the Lambertian term
+        float lambertTerm = fmaxf(0.0f, dot((sampleNormal), (-1.0 * dir)));
+
+        bool lightBlocked = CUDARAD::g_pDeviceRayTracer->LOS_blocked(
+            sampleLightPos, samplePos
+        );
+
+        if (!lightBlocked) {
+            // This light can be seen from the position of the sample.
+            // Calculate attenuation
+            // If the sample point is within the radius of the light, it doens't attenuate.
+            float attenuation = 0.0f;
+
+            if (dist < radius) {
+                attenuation = 1.0f;
+            }
+            else{
+                attenuation = attenuate(light, dist);  // We shouldn't be attenuation from the center of the light. It should be from the edge of the sphere right?
+            }
+            // Calculate light contribution
+            float3 lightContribution = make_float3(light.intensity);
+            lightContribution *= lambertTerm * penumbraScale * attenuation;// *255.0f);
+
+            return lightContribution;
+        }
+        else {
+            return make_float3(0, 0, 0);  // No contribution if the light is blocked
+        }
+    }
+
+    __device__ float3 sample_at(
+        CUDABSP::CUDABSP& cudaBSP,
+        float3 samplePos,
+        float3 sampleNormal = make_float3()
+    ) {
+        unsigned int seed = blockIdx.x * blockDim.x + threadIdx.x;
+        uint8_t* pvs = CUDABSP::pvs_for_pos(cudaBSP, samplePos);
+        size_t numClusters = cudaBSP.numVisClusters;
+
+        float3 result = make_float3();
+        int numSamples = 200;  // Number of sample points within the light's radius
+
+        for (size_t lightIndex = 0; lightIndex < cudaBSP.numWorldLights; lightIndex++) {
+            BSP::DWorldLight& light = cudaBSP.worldLights[lightIndex];
+
+            if (!CUDABSP::cluster_in_pvs(light.cluster, pvs, numClusters)) {
+                continue;
+            }
+
+            float3 lightPos = make_float3(light.origin);
+            float radius = 20.0f;  // Assuming the light object has a radius property
+
+            float3 totalContribution = make_float3(0, 0, 0);
+
+            for (int i = 0; i < numSamples; ++i) {
+                unsigned int sampleSeed = seed * 1000 + i;
+                // Generate a random sample point within the light's radius
+                float3 sampleLightPos = randomPointOnSphereSurface(lightPos, radius, sampleSeed);
+
+                // Calculate the light contribution from this sample point to the surface point
+                float3 contribution = calculateLightContribution(sampleLightPos, samplePos, sampleNormal, light, radius);
+
+                // Add this contribution to the total
+                totalContribution += contribution;
+            }
+
+            // Average the total contribution
+            float3 averageContribution = totalContribution / numSamples;
+
+            // Add this light's contribution to the result
+            result += averageContribution;
+        }
+
+        return result;
+    }
+
+    //Ending custom code.
     __device__ float3 sample_at(
             CUDABSP::CUDABSP& cudaBSP,
             CUDARAD::FaceInfo& faceInfo,
